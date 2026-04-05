@@ -1,5 +1,5 @@
 # heartrate_webui
-支持BLE心率设备监测的webui，目前只做了小米手环优化
+支持BLE心率设备监测的webui，带有一个方便obs等软件导入直播源的心率组件。目前只做了小米手环优化
 
 <img width="593" height="375" alt="image" src="https://github.com/user-attachments/assets/6cbda132-88c6-4399-932d-799950b33b4f" />
 
@@ -32,9 +32,15 @@ python heartrate_webui.py
 4. 访问WebUI
 
 ```
-127.0.0.1:8000
+http://127.0.0.1:8000
 ```
 
 5. 填入设备MAC
 
 从设备的设置等位置获取到设备的蓝牙MAC号，并填入页面下方`监听捕获 MAC`框中，随后点击应用设置。
+
+6. [可选]访问心率组件
+
+```
+http://127.0.0.1:8000/live
+```
