@@ -51,6 +51,7 @@ def init_db():
 class DeviceState:
     def __init__(self):
         self.connected_websockets = []
+        self.scan_websockets = []  # 扫描页面的 WebSocket 连接
         self.is_scanning = False
         self.scanner = None
         
@@ -65,6 +66,10 @@ class DeviceState:
         self.session_start_time = 0
         self.session_packet_count = 0
         self.current_session_id = None
+        
+        # 扫描页面：记录所有发现设备的广播数据
+        self.scan_devices = {}  # {mac: {...完整广播信息}}
+        self.scan_device_count = 0  # 累计发现的唯一设备总数
         
         # Load from DB parameters
         self.load_settings()
@@ -238,13 +243,38 @@ async def broadcast_update():
         except Exception:
             state.connected_websockets.remove(ws)
 
+async def broadcast_scan_update():
+    """向所有扫描页面 WebSocket 广播设备列表"""
+    if not state.scan_websockets:
+        return
+    
+    data = json.dumps({
+        "devices": state.scan_devices,
+        "is_scanning": state.is_scanning,
+        "total": state.scan_device_count
+    })
+    
+    for ws in state.scan_websockets.copy():
+        try:
+            await ws.send_text(data)
+        except Exception:
+            if ws in state.scan_websockets:
+                state.scan_websockets.remove(ws)
+
 async def background_tick_loop():
     """定时触发广播与数据库清理"""
+    scan_tick_acc = 0.0  # 扫描页面广播累计计时器
     while True:
         target_interval = state.chart_refresh_interval
         await asyncio.sleep(target_interval)
+        scan_tick_acc += target_interval
             
         await broadcast_update()
+        
+        # 扫描页面每 ~1 秒广播一次（避免大量设备数据高频推送）
+        if scan_tick_acc >= 1.0:
+            scan_tick_acc = 0.0
+            await broadcast_scan_update()
         
         # 自动清理超出最长保存时间的数据
         try:
@@ -260,6 +290,49 @@ async def background_tick_loop():
 
 # ================= 蓝牙接收回调 =================
 def detection_callback(device, advertisement_data):
+    # ===== 全局设备扫描记录（供 /scan 页面使用）=====
+    now_ms = int(time.time() * 1000)
+    mac = device.address.upper()
+    
+    # 提取所有制造商数据
+    manuf_data_all = {}
+    for mid, mdata in advertisement_data.manufacturer_data.items():
+        manuf_data_all[str(mid)] = {
+            "hex": mdata.hex().upper(),
+            "bytes": list(mdata),
+            "length": len(mdata)
+        }
+    
+    # 提取服务数据
+    service_data_all = {}
+    if advertisement_data.service_data:
+        for uuid, sdata in advertisement_data.service_data.items():
+            service_data_all[uuid] = {
+                "hex": sdata.hex().upper(),
+                "bytes": list(sdata),
+                "length": len(sdata)
+            }
+    
+    is_new = mac not in state.scan_devices
+    
+    state.scan_devices[mac] = {
+        "name": device.name or advertisement_data.local_name or "",
+        "mac": mac,
+        "rssi": advertisement_data.rssi,
+        "manufacturer_data": manuf_data_all,
+        "service_uuids": list(advertisement_data.service_uuids) if advertisement_data.service_uuids else [],
+        "service_data": service_data_all,
+        "tx_power": advertisement_data.tx_power,
+        "last_seen_ms": now_ms,
+        "last_seen_text": datetime.now().strftime("%H:%M:%S.%f")[:-3],
+        "hit_count": state.scan_devices.get(mac, {}).get("hit_count", 0) + 1,
+        "first_seen_text": state.scan_devices.get(mac, {}).get("first_seen_text", datetime.now().strftime("%H:%M:%S.%f")[:-3])
+    }
+    
+    if is_new:
+        state.scan_device_count += 1
+    
+    # ===== 原有心率数据过滤逻辑 =====
     if not state.target_mac or device.address.upper() != state.target_mac.upper():
         return
         
@@ -267,8 +340,6 @@ def detection_callback(device, advertisement_data):
     if manuf_data and len(manuf_data) > 3:
         heart_rate = manuf_data[3]
         if 0 < heart_rate < 255:
-            now_ms = int(time.time() * 1000)
-            
             conn = sqlite3.connect(DB_FILE)
             c = conn.cursor()
             c.execute('SELECT MAX(timestamp_ms) FROM hr_logs')
@@ -459,7 +530,7 @@ HTML_DASHBOARD = """
            <div class="absolute inset-x-0 -top-10 h-20 bg-neutral-600/10 blur-2xl pointer-events-none transition duration-500 group-hover:bg-neutral-600/20"></div>
            <div class="relative z-10">
                 <h1 class="text-2xl md:text-3xl font-black text-white tracking-widest uppercase">BLE 实时心率展示</h1>
-                <p class="text-xs text-neutral-500 mt-2 font-mono">OBS极简心率组件: <a href="/live" target="_blank" class="text-neutral-400 hover:text-white transition bg-neutral-900 px-2 py-0.5 rounded cursor-pointer">http://127.0.0.1:8000/live</a></p>
+                <p class="text-xs text-neutral-500 mt-2 font-mono">OBS极简心率组件: <a href="/live" target="_blank" class="text-neutral-400 hover:text-white transition bg-neutral-900 px-2 py-0.5 rounded cursor-pointer">http://127.0.0.1:8000/live</a> · <a href="/scan" target="_blank" class="text-neutral-400 hover:text-white transition bg-neutral-900 px-2 py-0.5 rounded cursor-pointer">📡 设备扫描探测器</a></p>
            </div>
            <div class="flex flex-col items-end relative z-10">
                <button onclick="toggleScan()" class="group/btn flex items-center gap-3 bg-neutral-900 px-4 py-2 rounded-full border border-neutral-800 hover:border-neutral-700 transition cursor-pointer shadow-inner">
@@ -1024,6 +1095,490 @@ HTML_DASHBOARD = """
 </html>
 """
 
+# ================= 前端模板：蓝牙设备扫描探测器 =================
+HTML_SCAN = """
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BLE 设备扫描探测器</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { background-color: #050505; color: #e5e5e5; }
+        .glass { background: rgba(15, 15, 15, 0.7); backdrop-filter: blur(16px); border: 1px solid #262626; box-shadow: inset 0 1px 0 rgba(255,255,255,0.05); }
+        input[type="text"], input[type="search"] { background: #171717; border: 1px solid #404040; color: #e5e5e5; outline: none; transition: border 0.2s; }
+        input[type="text"]:focus, input[type="search"]:focus { border-color: #6366f1; }
+
+        /* 自定义滚动条 */
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: #0a0a0a; }
+        ::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: #555; }
+
+        /* 设备行动画 */
+        .device-row { transition: all 0.3s ease; }
+        .device-row:hover { background: rgba(99, 102, 241, 0.08) !important; }
+        .device-row.new-flash { animation: flash-in 1s ease-out; }
+        @keyframes flash-in {
+            0% { background: rgba(99, 102, 241, 0.3); }
+            100% { background: transparent; }
+        }
+
+        /* 信号强度条 */
+        .rssi-bar-bg { background: #1a1a1a; }
+        .rssi-bar-fill { transition: width 0.5s ease, background 0.5s ease; }
+
+        /* 展开详情面板 */
+        .detail-panel { max-height: 0; overflow: hidden; transition: max-height 0.4s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.3s ease; opacity: 0; }
+        .detail-panel.open { max-height: 800px; opacity: 1; }
+
+        /* 数据标签 */
+        .data-tag { font-size: 10px; padding: 2px 6px; border-radius: 4px; font-family: monospace; display: inline-block; margin: 1px; }
+        .tag-manuf { background: rgba(168, 85, 247, 0.15); color: #c084fc; border: 1px solid rgba(168, 85, 247, 0.2); }
+        .tag-service { background: rgba(59, 130, 246, 0.15); color: #93c5fd; border: 1px solid rgba(59, 130, 246, 0.2); }
+        .tag-uuid { background: rgba(16, 185, 129, 0.15); color: #6ee7b7; border: 1px solid rgba(16, 185, 129, 0.2); }
+
+        /* 脉冲扫描指示器 */
+        @keyframes scan-pulse {
+            0% { transform: scale(1); opacity: 1; }
+            50% { transform: scale(1.8); opacity: 0; }
+            100% { transform: scale(1); opacity: 0; }
+        }
+        .scan-ring { animation: scan-pulse 2s infinite ease-out; }
+
+        /* 排序箭头 */
+        .sort-btn { cursor: pointer; user-select: none; }
+        .sort-btn:hover { color: #a5b4fc; }
+        .sort-active { color: #818cf8 !important; }
+
+        /* 复制按钮 */
+        .copy-btn { opacity: 0; transition: opacity 0.2s; }
+        .device-row:hover .copy-btn { opacity: 1; }
+
+        /* 统计卡片微光 */
+        .stat-glow { position: absolute; width: 80px; height: 80px; border-radius: 50%; filter: blur(30px); pointer-events: none; transition: opacity 0.5s; }
+    </style>
+</head>
+<body class="p-4 md:p-8 min-h-screen font-sans flex justify-center">
+    <div class="max-w-7xl w-full space-y-6">
+
+        <!-- HEADER -->
+        <div class="glass flex justify-between items-center rounded-2xl p-6 shadow-2xl relative overflow-hidden group">
+            <div class="absolute inset-x-0 -top-10 h-20 bg-indigo-600/10 blur-2xl pointer-events-none transition duration-500 group-hover:bg-indigo-600/20"></div>
+            <div class="relative z-10">
+                <h1 class="text-2xl md:text-3xl font-black text-white tracking-widest uppercase">BLE 设备扫描探测器</h1>
+                <p class="text-xs text-neutral-500 mt-2 font-mono">发现附近所有蓝牙广播设备 · 完整原始数据查看 · <a href="/" class="text-neutral-400 hover:text-white transition bg-neutral-900 px-2 py-0.5 rounded cursor-pointer">← 返回仪表盘</a></p>
+            </div>
+            <div class="flex items-center gap-4 relative z-10">
+                <!-- 扫描状态指示 -->
+                <div class="flex items-center gap-3">
+                    <div class="relative flex h-3 w-3">
+                        <span class="scan-ring absolute h-full w-full rounded-full bg-indigo-500 opacity-75" id="scan-ring"></span>
+                        <span class="relative h-3 w-3 rounded-full bg-indigo-500 shadow-[0_0_10px_rgba(99,102,241,0.8)]" id="scan-dot"></span>
+                    </div>
+                    <span id="scan-status-text" class="text-sm font-bold text-indigo-400 tracking-wider">扫描中...</span>
+                </div>
+                <button onclick="clearDevices()" class="px-4 py-2 rounded-xl bg-neutral-900 border border-neutral-800 hover:border-red-800 text-neutral-400 hover:text-red-400 text-xs font-bold tracking-wider transition cursor-pointer">清空列表</button>
+            </div>
+        </div>
+
+        <!-- 统计概览 -->
+        <div class="grid grid-cols-2 lg:grid-cols-4 gap-4">
+            <div class="glass rounded-2xl p-5 relative overflow-hidden">
+                <div class="stat-glow top-0 right-0 bg-indigo-500/20"></div>
+                <div class="text-[10px] text-neutral-500 font-bold uppercase tracking-widest mb-1">发现设备</div>
+                <div class="text-3xl font-black text-white font-mono" id="stat-total">0</div>
+            </div>
+            <div class="glass rounded-2xl p-5 relative overflow-hidden">
+                <div class="stat-glow top-0 right-0 bg-emerald-500/20"></div>
+                <div class="text-[10px] text-neutral-500 font-bold uppercase tracking-widest mb-1">有名称设备</div>
+                <div class="text-3xl font-black text-emerald-400 font-mono" id="stat-named">0</div>
+            </div>
+            <div class="glass rounded-2xl p-5 relative overflow-hidden">
+                <div class="stat-glow top-0 right-0 bg-purple-500/20"></div>
+                <div class="text-[10px] text-neutral-500 font-bold uppercase tracking-widest mb-1">有制造商数据</div>
+                <div class="text-3xl font-black text-purple-400 font-mono" id="stat-manuf">0</div>
+            </div>
+            <div class="glass rounded-2xl p-5 relative overflow-hidden">
+                <div class="stat-glow top-0 right-0 bg-blue-500/20"></div>
+                <div class="text-[10px] text-neutral-500 font-bold uppercase tracking-widest mb-1">累计广播包</div>
+                <div class="text-3xl font-black text-blue-400 font-mono" id="stat-packets">0</div>
+            </div>
+        </div>
+
+        <!-- 搜索与过滤 -->
+        <div class="glass rounded-2xl p-4 flex flex-col md:flex-row gap-4 items-center">
+            <div class="relative flex-1 w-full">
+                <input type="search" id="search-input" placeholder="搜索设备名称、MAC 地址、UUID..." class="w-full px-4 py-3 rounded-xl text-sm font-mono pl-10" oninput="applyFilters()">
+                <svg class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-neutral-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/></svg>
+            </div>
+            <div class="flex gap-2 flex-wrap">
+                <button onclick="toggleFilter('named')" id="filter-named" class="px-3 py-2 rounded-lg text-[11px] font-bold tracking-wider border border-neutral-800 bg-neutral-900 text-neutral-500 hover:border-emerald-800 hover:text-emerald-400 transition cursor-pointer">仅有名称</button>
+                <button onclick="toggleFilter('manuf')" id="filter-manuf" class="px-3 py-2 rounded-lg text-[11px] font-bold tracking-wider border border-neutral-800 bg-neutral-900 text-neutral-500 hover:border-purple-800 hover:text-purple-400 transition cursor-pointer">有制造商数据</button>
+                <button onclick="toggleFilter('strong')" id="filter-strong" class="px-3 py-2 rounded-lg text-[11px] font-bold tracking-wider border border-neutral-800 bg-neutral-900 text-neutral-500 hover:border-blue-800 hover:text-blue-400 transition cursor-pointer">强信号 (≥-70)</button>
+                <select id="sort-select" onchange="applyFilters()" class="px-3 py-2 rounded-lg text-[11px] font-bold tracking-wider border border-neutral-800 bg-neutral-900 text-neutral-400 outline-none cursor-pointer">
+                    <option value="rssi">按信号强度排序 ↓</option>
+                    <option value="name">按名称排序 A→Z</option>
+                    <option value="mac">按 MAC 排序</option>
+                    <option value="recent">按最近发现排序</option>
+                    <option value="hits">按广播次数排序 ↓</option>
+                </select>
+            </div>
+        </div>
+
+        <!-- 设备列表 -->
+        <div class="glass rounded-2xl overflow-hidden">
+            <!-- 表头 -->
+            <div class="grid grid-cols-12 gap-2 px-6 py-3 text-[10px] font-bold text-neutral-600 uppercase tracking-widest border-b border-neutral-800/50 bg-black/30">
+                <div class="col-span-1">信号</div>
+                <div class="col-span-2">MAC 地址</div>
+                <div class="col-span-3">设备名称</div>
+                <div class="col-span-2">制造商数据</div>
+                <div class="col-span-1">广播次数</div>
+                <div class="col-span-2">最后发现</div>
+                <div class="col-span-1">操作</div>
+            </div>
+            <!-- 设备行列表容器 -->
+            <div id="device-list" class="max-h-[60vh] overflow-y-auto">
+                <div class="text-center py-20 text-neutral-600">
+                    <div class="text-4xl mb-4">📡</div>
+                    <div class="text-sm font-mono">正在扫描附近蓝牙设备...</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 底部信息 -->
+        <div class="text-center text-[10px] text-neutral-700 font-mono py-2">
+            扫描数据每 1 秒自动刷新 · 点击设备行查看完整广播数据
+        </div>
+    </div>
+
+    <!-- 复制成功提示 -->
+    <div id="copy-toast" class="fixed bottom-6 right-6 bg-emerald-600 text-white px-4 py-2 rounded-xl text-sm font-bold shadow-[0_0_20px_rgba(16,185,129,0.4)] transition-all duration-300 opacity-0 translate-y-4 pointer-events-none z-50">
+        ✓ 已复制到剪贴板
+    </div>
+
+    <script>
+        let allDevices = {};
+        let activeFilters = new Set();
+        let expandedMac = null;
+        let ws;
+
+        // ========== WebSocket 连接 ==========
+        function connect() {
+            ws = new WebSocket(`ws://${window.location.host}/ws/scan`);
+
+            ws.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+                allDevices = data.devices || {};
+                updateStats(data);
+                renderDeviceList();
+            };
+
+            ws.onclose = function() {
+                document.getElementById('scan-status-text').innerText = '连接断开...';
+                document.getElementById('scan-dot').className = 'relative h-3 w-3 rounded-full bg-red-500 shadow-[0_0_10px_rgba(239,68,68,0.8)]';
+                document.getElementById('scan-ring').style.display = 'none';
+                setTimeout(connect, 2000);
+            };
+
+            ws.onopen = function() {
+                document.getElementById('scan-status-text').innerText = '扫描中...';
+                document.getElementById('scan-dot').className = 'relative h-3 w-3 rounded-full bg-indigo-500 shadow-[0_0_10px_rgba(99,102,241,0.8)]';
+                document.getElementById('scan-ring').style.display = 'block';
+            };
+        }
+
+        // ========== 统计更新 ==========
+        function updateStats(data) {
+            const devices = Object.values(allDevices);
+            document.getElementById('stat-total').innerText = devices.length;
+            document.getElementById('stat-named').innerText = devices.filter(d => d.name && d.name.length > 0).length;
+            document.getElementById('stat-manuf').innerText = devices.filter(d => Object.keys(d.manufacturer_data || {}).length > 0).length;
+
+            let totalHits = 0;
+            for (const d of devices) totalHits += d.hit_count || 0;
+            document.getElementById('stat-packets').innerText = totalHits;
+        }
+
+        // ========== 过滤与排序 ==========
+        function toggleFilter(name) {
+            const btn = document.getElementById('filter-' + name);
+            if (activeFilters.has(name)) {
+                activeFilters.delete(name);
+                btn.classList.remove('border-indigo-600', 'text-indigo-400', 'bg-indigo-950/50');
+                btn.classList.add('border-neutral-800', 'text-neutral-500', 'bg-neutral-900');
+            } else {
+                activeFilters.add(name);
+                btn.classList.add('border-indigo-600', 'text-indigo-400', 'bg-indigo-950/50');
+                btn.classList.remove('border-neutral-800', 'text-neutral-500', 'bg-neutral-900');
+            }
+            renderDeviceList();
+        }
+
+        function applyFilters() {
+            renderDeviceList();
+        }
+
+        function getFilteredDevices() {
+            let devices = Object.values(allDevices);
+            const query = (document.getElementById('search-input').value || '').toLowerCase();
+
+            // 文本搜索
+            if (query) {
+                devices = devices.filter(d => {
+                    const searchStr = [
+                        d.name, d.mac,
+                        ...Object.keys(d.manufacturer_data || {}),
+                        ...Object.values(d.manufacturer_data || {}).map(v => v.hex || ''),
+                        ...(d.service_uuids || []),
+                        ...Object.keys(d.service_data || {}),
+                        ...Object.values(d.service_data || {}).map(v => v.hex || '')
+                    ].join(' ').toLowerCase();
+                    return searchStr.includes(query);
+                });
+            }
+
+            // 按钮过滤
+            if (activeFilters.has('named')) devices = devices.filter(d => d.name && d.name.length > 0);
+            if (activeFilters.has('manuf')) devices = devices.filter(d => Object.keys(d.manufacturer_data || {}).length > 0);
+            if (activeFilters.has('strong')) devices = devices.filter(d => d.rssi >= -70);
+
+            // 排序
+            const sort = document.getElementById('sort-select').value;
+            switch (sort) {
+                case 'rssi': devices.sort((a, b) => b.rssi - a.rssi); break;
+                case 'name': devices.sort((a, b) => (a.name || 'zzz').localeCompare(b.name || 'zzz')); break;
+                case 'mac': devices.sort((a, b) => a.mac.localeCompare(b.mac)); break;
+                case 'recent': devices.sort((a, b) => b.last_seen_ms - a.last_seen_ms); break;
+                case 'hits': devices.sort((a, b) => (b.hit_count || 0) - (a.hit_count || 0)); break;
+            }
+
+            return devices;
+        }
+
+        // ========== 渲染设备列表 ==========
+        function renderDeviceList() {
+            const container = document.getElementById('device-list');
+            const devices = getFilteredDevices();
+
+            if (devices.length === 0) {
+                container.innerHTML = `<div class="text-center py-20 text-neutral-600">
+                    <div class="text-4xl mb-4">📡</div>
+                    <div class="text-sm font-mono">${Object.keys(allDevices).length === 0 ? '正在扫描附近蓝牙设备...' : '没有匹配的设备'}</div>
+                </div>`;
+                return;
+            }
+
+            let html = '';
+            for (const d of devices) {
+                const rssiPct = Math.max(0, Math.min(100, (d.rssi + 100) * (100 / 60)));
+                let rssiColor, rssiTextColor;
+                if (rssiPct > 70) { rssiColor = '#10b981'; rssiTextColor = 'text-emerald-400'; }
+                else if (rssiPct > 40) { rssiColor = '#eab308'; rssiTextColor = 'text-yellow-400'; }
+                else { rssiColor = '#ef4444'; rssiTextColor = 'text-red-400'; }
+
+                const hasManuf = Object.keys(d.manufacturer_data || {}).length > 0;
+                const manufSummary = hasManuf
+                    ? Object.entries(d.manufacturer_data).map(([id, v]) => `<span class="data-tag tag-manuf">ID:${id} (${v.length}B)</span>`).join('')
+                    : '<span class="text-neutral-700 text-[10px]">无</span>';
+
+                const isExpanded = expandedMac === d.mac;
+
+                html += `
+                <div class="device-row border-b border-neutral-900/50" data-mac="${d.mac}">
+                    <div class="grid grid-cols-12 gap-2 px-6 py-3 items-center cursor-pointer hover:bg-neutral-900/30" onclick="toggleDetail('${d.mac}')">
+                        <div class="col-span-1">
+                            <div class="flex flex-col gap-1">
+                                <span class="font-mono text-xs font-bold ${rssiTextColor}">${d.rssi}</span>
+                                <div class="rssi-bar-bg rounded-full h-1.5 w-full">
+                                    <div class="rssi-bar-fill h-full rounded-full" style="width:${rssiPct}%;background:${rssiColor}"></div>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="col-span-2">
+                            <span class="font-mono text-[11px] text-indigo-300 tracking-wide">${d.mac}</span>
+                        </div>
+                        <div class="col-span-3">
+                            <span class="text-sm ${d.name ? 'text-white font-semibold' : 'text-neutral-600 italic'}">${d.name || '未知设备'}</span>
+                        </div>
+                        <div class="col-span-2">${manufSummary}</div>
+                        <div class="col-span-1">
+                            <span class="font-mono text-xs text-neutral-400">${d.hit_count || 0}</span>
+                        </div>
+                        <div class="col-span-2">
+                            <span class="font-mono text-[11px] text-neutral-500">${d.last_seen_text}</span>
+                        </div>
+                        <div class="col-span-1 flex gap-1">
+                            <button onclick="event.stopPropagation();copyText('${d.mac}')" class="copy-btn px-2 py-1 rounded bg-neutral-900 border border-neutral-800 text-[10px] text-neutral-400 hover:text-indigo-400 hover:border-indigo-800 transition" title="复制 MAC">MAC</button>
+                            <button onclick="event.stopPropagation();useMac('${d.mac}')" class="copy-btn px-2 py-1 rounded bg-neutral-900 border border-neutral-800 text-[10px] text-neutral-400 hover:text-emerald-400 hover:border-emerald-800 transition" title="设为监听目标">选用</button>
+                        </div>
+                    </div>
+
+                    <!-- 展开详情面板 -->
+                    <div class="detail-panel ${isExpanded ? 'open' : ''}" id="detail-${d.mac.replace(/:/g, '')}">
+                        <div class="px-6 pb-4 pt-1 border-t border-neutral-800/30">
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                <!-- 基础信息 -->
+                                <div class="bg-black/40 rounded-xl p-4 border border-neutral-800/50">
+                                    <div class="text-[10px] text-neutral-500 font-bold uppercase tracking-widest mb-3">基础信息</div>
+                                    <div class="space-y-2 text-[11px] font-mono">
+                                        <div class="flex justify-between"><span class="text-neutral-500">MAC 地址</span><span class="text-indigo-300">${d.mac}</span></div>
+                                        <div class="flex justify-between"><span class="text-neutral-500">设备名称</span><span class="text-white">${d.name || '(空)'}</span></div>
+                                        <div class="flex justify-between"><span class="text-neutral-500">RSSI 信号</span><span class="${rssiTextColor}">${d.rssi} dBm</span></div>
+                                        <div class="flex justify-between"><span class="text-neutral-500">TX Power</span><span class="text-neutral-300">${d.tx_power !== null && d.tx_power !== undefined ? d.tx_power + ' dBm' : '(未报告)'}</span></div>
+                                        <div class="flex justify-between"><span class="text-neutral-500">首次发现</span><span class="text-neutral-400">${d.first_seen_text || '--'}</span></div>
+                                        <div class="flex justify-between"><span class="text-neutral-500">最后发现</span><span class="text-neutral-400">${d.last_seen_text}</span></div>
+                                        <div class="flex justify-between"><span class="text-neutral-500">累计包数</span><span class="text-blue-400">${d.hit_count || 0}</span></div>
+                                    </div>
+                                </div>
+
+                                <!-- 制造商数据 -->
+                                <div class="bg-black/40 rounded-xl p-4 border border-neutral-800/50">
+                                    <div class="text-[10px] text-neutral-500 font-bold uppercase tracking-widest mb-3">制造商数据 (Manufacturer Data)</div>
+                                    ${renderManufDetail(d.manufacturer_data)}
+                                </div>
+
+                                <!-- 服务 UUID -->
+                                <div class="bg-black/40 rounded-xl p-4 border border-neutral-800/50">
+                                    <div class="text-[10px] text-neutral-500 font-bold uppercase tracking-widest mb-3">服务 UUID (Service UUIDs)</div>
+                                    ${renderServiceUuids(d.service_uuids)}
+                                </div>
+
+                                <!-- 服务数据 -->
+                                <div class="bg-black/40 rounded-xl p-4 border border-neutral-800/50">
+                                    <div class="text-[10px] text-neutral-500 font-bold uppercase tracking-widest mb-3">服务数据 (Service Data)</div>
+                                    ${renderServiceData(d.service_data)}
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>`;
+            }
+
+            container.innerHTML = html;
+        }
+
+        // ========== 详情渲染辅助函数 ==========
+        function renderManufDetail(manufData) {
+            if (!manufData || Object.keys(manufData).length === 0) {
+                return '<div class="text-neutral-700 text-[11px] font-mono">此设备未广播制造商数据</div>';
+            }
+            let html = '';
+            for (const [id, data] of Object.entries(manufData)) {
+                html += `<div class="mb-3 last:mb-0">
+                    <div class="flex items-center gap-2 mb-1">
+                        <span class="data-tag tag-manuf">ID: ${id} (0x${parseInt(id).toString(16).toUpperCase().padStart(4,'0')})</span>
+                        <span class="text-[10px] text-neutral-600">${data.length} bytes</span>
+                        <button onclick="event.stopPropagation();copyText('${data.hex}')" class="text-[9px] text-neutral-600 hover:text-purple-400 transition cursor-pointer">[复制]</button>
+                    </div>
+                    <div class="bg-neutral-950 rounded p-2 font-mono text-[11px] text-purple-300 break-all border border-neutral-800/50">
+                        HEX: ${formatHex(data.hex)}
+                    </div>
+                    <div class="bg-neutral-950 rounded p-2 font-mono text-[10px] text-neutral-500 break-all border border-neutral-800/50 mt-1">
+                        DEC: [${(data.bytes || []).join(', ')}]
+                    </div>
+                </div>`;
+            }
+            return html;
+        }
+
+        function renderServiceUuids(uuids) {
+            if (!uuids || uuids.length === 0) {
+                return '<div class="text-neutral-700 text-[11px] font-mono">无服务 UUID</div>';
+            }
+            return uuids.map(u => `<div class="mb-1"><span class="data-tag tag-uuid">${u}</span></div>`).join('');
+        }
+
+        function renderServiceData(serviceData) {
+            if (!serviceData || Object.keys(serviceData).length === 0) {
+                return '<div class="text-neutral-700 text-[11px] font-mono">此设备未广播服务数据</div>';
+            }
+            let html = '';
+            for (const [uuid, data] of Object.entries(serviceData)) {
+                html += `<div class="mb-3 last:mb-0">
+                    <div class="flex items-center gap-2 mb-1">
+                        <span class="data-tag tag-service">${uuid}</span>
+                        <span class="text-[10px] text-neutral-600">${data.length} bytes</span>
+                        <button onclick="event.stopPropagation();copyText('${data.hex}')" class="text-[9px] text-neutral-600 hover:text-blue-400 transition cursor-pointer">[复制]</button>
+                    </div>
+                    <div class="bg-neutral-950 rounded p-2 font-mono text-[11px] text-blue-300 break-all border border-neutral-800/50">
+                        HEX: ${formatHex(data.hex)}
+                    </div>
+                    <div class="bg-neutral-950 rounded p-2 font-mono text-[10px] text-neutral-500 break-all border border-neutral-800/50 mt-1">
+                        DEC: [${(data.bytes || []).join(', ')}]
+                    </div>
+                </div>`;
+            }
+            return html;
+        }
+
+        function formatHex(hex) {
+            if (!hex) return '';
+            return hex.match(/.{1,2}/g).join(' ');
+        }
+
+        // ========== 交互操作 ==========
+        function toggleDetail(mac) {
+            const cleanMac = mac.replace(/:/g, '');
+            const panel = document.getElementById('detail-' + cleanMac);
+            if (expandedMac === mac) {
+                panel.classList.remove('open');
+                expandedMac = null;
+            } else {
+                // 关闭之前的
+                if (expandedMac) {
+                    const prevPanel = document.getElementById('detail-' + expandedMac.replace(/:/g, ''));
+                    if (prevPanel) prevPanel.classList.remove('open');
+                }
+                panel.classList.add('open');
+                expandedMac = mac;
+            }
+        }
+
+        function copyText(text) {
+            navigator.clipboard.writeText(text).then(() => {
+                const toast = document.getElementById('copy-toast');
+                toast.classList.remove('opacity-0', 'translate-y-4');
+                toast.classList.add('opacity-100', 'translate-y-0');
+                setTimeout(() => {
+                    toast.classList.add('opacity-0', 'translate-y-4');
+                    toast.classList.remove('opacity-100', 'translate-y-0');
+                }, 1500);
+            });
+        }
+
+        async function useMac(mac) {
+            await fetch('/api/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ mac: mac })
+            });
+            const toast = document.getElementById('copy-toast');
+            toast.innerText = '✓ 已设为监听目标: ' + mac;
+            toast.classList.remove('opacity-0', 'translate-y-4');
+            toast.classList.add('opacity-100', 'translate-y-0');
+            setTimeout(() => {
+                toast.innerText = '✓ 已复制到剪贴板';
+                toast.classList.add('opacity-0', 'translate-y-4');
+                toast.classList.remove('opacity-100', 'translate-y-0');
+            }, 2000);
+        }
+
+        async function clearDevices() {
+            await fetch('/api/scan/clear', { method: 'POST' });
+            allDevices = {};
+            renderDeviceList();
+        }
+
+        // 启动
+        connect();
+    </script>
+</body>
+</html>
+"""
+
 @app.get("/")
 async def get_dashboard():
     return HTMLResponse(HTML_DASHBOARD)
@@ -1031,6 +1586,11 @@ async def get_dashboard():
 @app.get("/live")
 async def get_live_overlay():
     return HTMLResponse(HTML_LIVE)
+
+@app.get("/scan")
+async def get_scan_page():
+    """蓝牙设备扫描探测器页面"""
+    return HTMLResponse(HTML_SCAN)
 
 @app.post("/api/toggle_scan")
 async def toggle_scan():
@@ -1093,6 +1653,13 @@ async def update_settings(request: Request):
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
+@app.post("/api/scan/clear")
+async def clear_scan_devices():
+    """清空扫描发现的设备列表"""
+    state.scan_devices.clear()
+    state.scan_device_count = 0
+    return {"status": "success"}
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -1104,10 +1671,32 @@ async def websocket_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         state.connected_websockets.remove(websocket)
 
+@app.websocket("/ws/scan")
+async def websocket_scan_endpoint(websocket: WebSocket):
+    """扫描页面专用 WebSocket：定时推送所有发现的设备数据"""
+    await websocket.accept()
+    state.scan_websockets.append(websocket)
+    # 立即发送一次当前数据
+    try:
+        await websocket.send_text(json.dumps({
+            "devices": state.scan_devices,
+            "is_scanning": state.is_scanning,
+            "total": state.scan_device_count
+        }))
+    except Exception:
+        pass
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        if websocket in state.scan_websockets:
+            state.scan_websockets.remove(websocket)
+
 if __name__ == "__main__":
     print("===================================================")
     print(" 🚀 BLE 实时心率展示系统启动成功！")
     print(" 🖥️  主控仪表盘页面: http://127.0.0.1:8000")
     print(" 🎥  OBS 源接入口: http://127.0.0.1:8000/live")
+    print(" 📡 蓝牙扫描探测器: http://127.0.0.1:8000/scan")
     print("===================================================\\n")
     uvicorn.run(app, host="0.0.0.0", port=8000, access_log=False)
